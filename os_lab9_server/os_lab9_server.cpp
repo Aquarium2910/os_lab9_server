@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 #pragma region Configuration
 
 // Порт за замовчуванням для прослуховування вхідних з'єднань.
-const char* DEFAULT_PORT = "8080";
+const char* DEFAULT_PORT = "54000";
 
 // Назва кореневої папки-пісочниці.
 // Сервер обмежує доступ до файлової системи лише цією директорією з міркувань безпеки.
@@ -44,6 +44,20 @@ struct FileInfoPacket {
 
 #pragma endregion
 
+#pragma region Cache System
+
+/// <summary>
+/// Структура для зберігання результатів останнього запиту.
+/// Дозволяє зменшити навантаження на диск при частих однакових запитах.
+/// </summary>
+struct Cache {
+    std::chrono::steady_clock::time_point timestamp; // Часова мітка останнього оновлення
+    std::string pathKey;                             // Ключ кешу: шлях
+    std::string extKey;                              // Ключ кешу: розширення
+    std::vector<FileInfoPacket> data;                // Закешовані дані
+} g_cache;
+
+#pragma endregion
 
 #pragma region Helper Functions
 
@@ -184,6 +198,108 @@ std::vector<FileInfoPacket> ScanDirectory(const std::string& subPath, const std:
     }
 
     return results;
+}
+
+#pragma endregion
+
+#pragma region Application Entry Point
+
+int main() {
+    // Встановлення кодової сторінки 1251 для коректного відображення кирилиці у консолі.
+    SetConsoleOutputCP(1251);
+
+    // Ініціалізація "пісочниці" сервера. Створюємо папку автоматично для зручності тестування.
+    if (!fs::exists(ROOT_DIR)) {
+        fs::create_directory(ROOT_DIR);
+        Log("Створено папку '" + ROOT_DIR + "'. Покладіть туди файли для тесту.");
+    }
+
+    // Ініціалізація бібліотеки WinSock.
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return 1;
+
+    // Налаштування адресної структури для сервера.
+    struct addrinfo* result = NULL;
+    struct addrinfo hints;
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_INET;       // IPv4
+    hints.ai_socktype = SOCK_STREAM; // TCP
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;     // Вказує, що сокет буде використовуватись для bind()
+
+    getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
+    SOCKET ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    bind(ListenSocket, result->ai_addr, (int)result->ai_addrlen);
+    freeaddrinfo(result);
+
+    // Початок прослуховування черги вхідних з'єднань.
+    listen(ListenSocket, SOMAXCONN);
+    Log(">>> СЕРВЕР ГОТОВИЙ (Порт " + std::string(DEFAULT_PORT) + ") <<<");
+    Log("Робоча папка: " + fs::absolute(ROOT_DIR).string());
+
+    // Безкінечний цикл обробки клієнтів.
+    while (true) {
+        // Блокуючий виклик: чекаємо на з'єднання.
+        SOCKET ClientSocket = accept(ListenSocket, NULL, NULL);
+        if (ClientSocket == INVALID_SOCKET) continue;
+
+        Log("\n[Connect] Клієнт підключився.");
+
+        RequestPacket req;
+        // Очікуємо структуру фіксованого розміру.
+        int iResult = recv(ClientSocket, (char*)&req, sizeof(req), 0);
+
+        if (iResult > 0) {
+            std::string reqPath = req.path;
+            std::string reqExt = req.extension;
+
+            Log("Запит: Папка='" + reqPath + "', Тип='" + reqExt + "'");
+
+            std::vector<FileInfoPacket> filesToSend;
+            bool fromCache = false;
+
+            // --- ЛОГІКА КЕШУВАННЯ ---
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_cache.timestamp).count();
+
+            // Перевіряємо валідність кешу (5 секунд + ідентичність параметрів),
+            // щоб уникнути зайвих операцій читання диску (I/O).
+            if (elapsed < 5 && g_cache.pathKey == reqPath && g_cache.extKey == reqExt) {
+                Log("[Cache] Використано кеш (запиту " + std::to_string(elapsed) + "с).");
+                filesToSend = g_cache.data;
+                fromCache = true;
+            }
+            else {
+                Log("[Disk] Сканування диску...");
+                filesToSend = ScanDirectory(reqPath, reqExt);
+
+                // Оновлюємо стан кешу для наступних запитів.
+                g_cache.timestamp = now;
+                g_cache.pathKey = reqPath;
+                g_cache.extKey = reqExt;
+                g_cache.data = filesToSend;
+            }
+            // ------------------------
+
+            // Крок 1: Відправляємо кількість записів, щоб клієнт знав скільки ітерацій recv робити.
+            int count = (int)filesToSend.size();
+            send(ClientSocket, (char*)&count, sizeof(count), 0);
+
+            // Крок 2: Відправляємо дані поштучно.
+            for (const auto& file : filesToSend) {
+                send(ClientSocket, (char*)&file, sizeof(file), 0);
+            }
+
+            Log("[Done] Відправлено " + std::to_string(count) + " записів.");
+        }
+
+        // Закриваємо з'єднання з конкретним клієнтом, але продовжуємо слухати порт.
+        closesocket(ClientSocket);
+    }
+
+    closesocket(ListenSocket);
+    WSACleanup();
+    return 0;
 }
 
 #pragma endregion
